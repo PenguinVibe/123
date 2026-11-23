@@ -1,0 +1,280 @@
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+
+local Player = Players.LocalPlayer
+local PLACE_ID = 4520749081
+
+local MAX_TIME = 600
+local CHECK_TIMEOUT = 30
+local RETRY_DELAY = 5
+
+local VISITED_FILE = "SerpentHop_Visited.json"
+
+local SCRIPT_URL = ""
+
+local function log(...)
+    print("[SerpentHop]", ...)
+end
+
+--==================================================
+-- VISITED
+--==================================================
+
+local visited = {}
+
+pcall(function()
+    if isfile(VISITED_FILE) then
+        visited = HttpService:JSONDecode(readfile(VISITED_FILE))
+    end
+end)
+
+local function saveVisited()
+    pcall(function()
+        writefile(VISITED_FILE, HttpService:JSONEncode(visited))
+    end)
+end
+
+--==================================================
+-- TIMER
+--==================================================
+
+local function parseTimer(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+
+    local h, m, s = value:match("^(%d+):(%d+):(%d+)$")
+
+    h = tonumber(h)
+    m = tonumber(m)
+    s = tonumber(s)
+
+    if not h or not m or not s then
+        return nil
+    end
+
+    if m > 59 or s > 59 then
+        return nil
+    end
+
+    return h * 3600 + m * 60 + s
+end
+
+--==================================================
+-- CHECK SERPENT
+-- true  = 留服
+-- false = 可以換服
+-- nil   = 無法判斷
+--==================================================
+
+local function checkSerpent()
+    local deadline = os.clock() + CHECK_TIMEOUT
+
+    repeat
+        local areas = workspace:FindFirstChild("Areas")
+        local serpent = areas and areas:FindFirstChild("SerpentLocation")
+
+        if serpent then
+            local timer = serpent:GetAttribute("Text")
+
+            -- 沒有倒數 = 海蛇已出現
+            if timer == nil or timer == "" then
+                log("海蛇已出現！停止 Hop")
+                return true, "已出現"
+            end
+
+            local seconds = parseTimer(timer)
+
+            if seconds then
+                log("Serpent:", timer)
+
+                if seconds <= MAX_TIME then
+                    log("剩餘時間在 10 分鐘內")
+                    return true, timer
+                end
+
+                return false, timer
+            end
+        end
+
+        task.wait(1)
+    until os.clock() >= deadline
+
+    return nil, "無法取得有效倒數"
+end
+
+--==================================================
+-- SERVER LIST
+--==================================================
+
+local function getServers(cursor)
+    local url =
+        "https://games.roblox.com/v1/games/"
+        .. PLACE_ID
+        .. "/servers/Public?sortOrder=Asc&limit=100"
+
+    if cursor then
+        url = url .. "&cursor=" .. HttpService:UrlEncode(cursor)
+    end
+
+    local response = request({
+        Url = url,
+        Method = "GET"
+    })
+
+    if type(response) ~= "table"
+        or response.StatusCode ~= 200 then
+        return nil
+    end
+
+    local success, data = pcall(function()
+        return HttpService:JSONDecode(response.Body)
+    end)
+
+    if not success then
+        return nil
+    end
+
+    return data
+end
+
+--==================================================
+-- FIND SERVER
+--==================================================
+
+local function findServer()
+    local cursor = nil
+
+    repeat
+        local data = getServers(cursor)
+
+        if not data then
+            log("伺服器列表讀取失敗")
+            return nil
+        end
+
+        local candidates = {}
+
+        for _, server in ipairs(data.data or {}) do
+            if server.id ~= game.JobId
+                and not visited[server.id]
+                and server.playing < server.maxPlayers then
+
+                table.insert(candidates, server)
+            end
+        end
+
+        if #candidates > 0 then
+            return candidates[math.random(1, #candidates)]
+        end
+
+        cursor = data.nextPageCursor
+
+    until not cursor
+
+    log("搜尋列表已完成，重置紀錄")
+
+    visited = {}
+    visited[game.JobId] = true
+    saveVisited()
+
+    return nil
+end
+
+--==================================================
+-- INITIAL CHECK
+--==================================================
+
+log("開始檢查 Serpent")
+
+local found, timer = checkSerpent()
+
+if found == true then
+    log("找到目標:", timer)
+    log("停止搜尋，留在目前伺服器")
+    return
+end
+
+if found == nil then
+    log("無法確認海蛇狀態，為避免誤跳服，本次停止")
+    return
+end
+
+log("倒數超過 10 分鐘:", timer)
+
+visited[game.JobId] = true
+saveVisited()
+
+--==================================================
+-- HOP LOOP
+--==================================================
+
+while true do
+
+    local server = findServer()
+
+    if not server then
+        task.wait(RETRY_DELAY)
+        continue
+    end
+
+    log("準備 Hop:", server.id)
+    log("玩家數:", server.playing, "/", server.maxPlayers)
+
+    -- 再次確認當前服狀態
+    local recheck, recheckTimer = checkSerpent()
+
+    if recheck == true then
+        log("海蛇已出現或進入 10 分鐘內")
+        log("取消 Hop")
+        return
+    end
+
+    if recheck == nil then
+        log("狀態不明，取消 Hop")
+        return
+    end
+
+    -- 排程跨服重新執行
+    if SCRIPT_URL == "" then
+        log("尚未設定 SCRIPT_URL，停止 Hop")
+        return
+    end
+
+    local queued, queueError = pcall(function()
+        queue_on_teleport(
+            "loadstring(game:HttpGet("
+            .. string.format("%q", SCRIPT_URL)
+            .. "))()"
+        )
+    end)
+
+    if not queued then
+        log("排程失敗:", queueError)
+        return
+    end
+
+    visited[server.id] = true
+    saveVisited()
+
+    local success, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(
+            PLACE_ID,
+            server.id,
+            Player
+        )
+    end)
+
+    if success then
+        log("傳送請求已送出")
+        return
+    else
+        log("傳送失敗:", err)
+
+        visited[server.id] = nil
+        saveVisited()
+
+        task.wait(RETRY_DELAY)
+    end
+end
